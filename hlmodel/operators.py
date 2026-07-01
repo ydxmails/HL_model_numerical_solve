@@ -52,30 +52,28 @@ def advection_matrix(gammadot: float, grid: Grid) -> sp.csr_matrix:
     """Conservative first-order upwind discretisation of -d_sigma(gammadot P).
 
     Sign-aware (stable for sign-changing oscillatory drives) and built with
-    no-flux ends so that it conserves mass exactly.
+    no-flux ends so that it conserves mass exactly.  Assembled directly from its
+    diagonals (no Python loop over nodes).
     """
     n, h = grid.n, grid.h
     v = float(gammadot)
-    A = sp.lil_matrix((n, n))
     if v == 0.0:
-        return A.tocsr()
+        return sp.csr_matrix((n, n))
     if v > 0.0:
-        # face value = upstream (left) node; J_{i+1/2} = v P_i
-        for i in range(n):
-            if i > 0:
-                A[i, i - 1] += v / h          # inflow from left face
-            if i < n - 1:
-                A[i, i] += -v / h             # outflow through right face
-            # i == n-1: right face is no-flux (no outflow term)
+        # J_{i+1/2} = v P_i (upstream = left): outflow -v/h on the diagonal
+        # (except the last node, no-flux), inflow +v/h on the sub-diagonal.
+        main = np.full(n, -v / h)
+        main[-1] = 0.0
+        sub = np.full(n - 1, v / h)              # offset -1: A[i, i-1]
+        A = sp.diags([sub, main], offsets=[-1, 0], format="csr")
     else:
-        # face value = upstream (right) node; J_{i+1/2} = v P_{i+1}
-        for i in range(n):
-            if i < n - 1:
-                A[i, i + 1] += -v / h         # inflow from right face
-            if i > 0:
-                A[i, i] += v / h              # outflow through left face
-            # i == 0: left face is no-flux (no outflow term)
-    return A.tocsr()
+        # J_{i+1/2} = v P_{i+1} (upstream = right): outflow +v/h on the diagonal
+        # (except the first node, no-flux), inflow -v/h on the super-diagonal.
+        main = np.full(n, v / h)
+        main[0] = 0.0
+        sup = np.full(n - 1, -v / h)             # offset +1: A[i, i+1]
+        A = sp.diags([main, sup], offsets=[0, 1], format="csr")
+    return A
 
 
 def yielding_matrix(grid: Grid) -> sp.csr_matrix:

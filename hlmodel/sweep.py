@@ -37,6 +37,7 @@ except Exception:  # threadpoolctl is optional
 from .grid import Grid
 from .operators import build_static_parts
 from .saos import liquid_base_state, saos_modulus
+from .selfconsistency import ALPHA_C
 from .steady import solve_steady, BOUNDARY_FRACTION_TOL
 from .periodic import solve_laos
 
@@ -77,28 +78,51 @@ def _saos_task(args):
 
 def _laos_task(args):
     alpha, gamma0, omega, grid_spec, opts = args
+    opts = dict(opts)
+    opts.setdefault("warn", False)   # aggregate in the parent instead of per worker
     with _limit_threads():
         grid = _make_grid(grid_spec)
         res = solve_laos(alpha, gamma0, omega, grid, **opts)
     return (gamma0, omega, res.G1_prime, res.G1_doubleprime,
-            res.response.intensity.copy(), res.residual, res.floquet)
+            res.response.intensity.copy(), res.residual, res.floquet,
+            res.converged)
 
 
 # --------------------------------------------------------------------------
 # generic parallel map
 # --------------------------------------------------------------------------
-def parallel_map(func, arg_list, n_workers: int | None = None):
-    """Map ``func`` over ``arg_list`` across processes, preserving order.
+def parallel_map(func, arg_list, n_workers: int | None = None, cost=None):
+    """Map ``func`` over ``arg_list`` across processes, preserving input order.
 
     Falls back to serial execution when only one worker is available.
+
+    If ``cost`` is given (one estimated relative runtime per task), the tasks are
+    dispatched longest-first (the classic LPT heuristic): this keeps every worker
+    busy until near the end and avoids the imbalance that occurs when the slow
+    tasks happen to sit together in the list (e.g. low-frequency LAOS points all
+    at the front of a sweep).  Results are returned in the original order
+    regardless of dispatch order.
     """
+    n = len(arg_list)
     if n_workers is None:
         n_workers = os.cpu_count() or 1
-    n_workers = max(1, min(n_workers, len(arg_list)))
-    if n_workers == 1:
+    n_workers = max(1, min(n_workers, n))
+    if n_workers == 1 or n <= 1:
         return [func(a) for a in arg_list]
+
+    order = list(range(n))
+    if cost is not None:
+        # dispatch most expensive first; remember how to put results back
+        order = sorted(order, key=lambda i: float(cost[i]), reverse=True)
+    reordered = [arg_list[i] for i in order]
+
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        return list(pool.map(func, arg_list))
+        results_in_dispatch_order = list(pool.map(func, reordered))
+
+    out = [None] * n
+    for slot, res in zip(order, results_in_dispatch_order):
+        out[slot] = res
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -189,11 +213,17 @@ class LAOSMap:
     G1pp: np.ndarray
     residual: np.ndarray
     floquet: np.ndarray
+    converged: np.ndarray         # per-point convergence flag
 
 
 def laos_map(alpha: float, gamma0s, omegas, grid: Grid | None = None,
              n_workers: int | None = None, **solver_opts) -> LAOSMap:
-    """LAOS first-harmonic moduli over a (gamma0, omega) grid, in parallel."""
+    """LAOS first-harmonic moduli over a (gamma0, omega) grid, in parallel.
+
+    Points that fail to converge are reported in a single consolidated warning
+    (and flagged in the returned ``converged`` array) rather than warning from
+    each worker process.
+    """
     if grid is None:
         grid = Grid()
     spec = (grid.sigma_max, grid.n_per_unit)
@@ -201,17 +231,114 @@ def laos_map(alpha: float, gamma0s, omegas, grid: Grid | None = None,
     ws = np.atleast_1d(np.asarray(omegas, dtype=float))
     args = [(alpha, float(g), float(w), spec, solver_opts)
             for g in g0s for w in ws]
-    out = parallel_map(_laos_task, args, n_workers)
+    # cost proxy: period solves scale with the step count, which is bounded below
+    # by steps_per_period and grows like 1/omega once dt hits its cap (low omega
+    # => long period => many steps).  Dispatching these first balances the pool.
+    spp = float(solver_opts.get("steps_per_period", 400))
+    dt_cap = min(float(solver_opts.get("dt_max", 0.5)), 0.9)
+    cost = [max(spp, np.ceil((2.0 * np.pi / float(w)) / dt_cap))
+            for _g in g0s for w in ws]
+    out = parallel_map(_laos_task, args, n_workers, cost=cost)
 
     ng, nw = g0s.size, ws.size
     G1p = np.empty((ng, nw)); G1pp = np.empty((ng, nw))
     resid = np.empty((ng, nw)); floq = np.full((ng, nw), np.nan)
+    conv = np.empty((ng, nw), dtype=bool)
     idx = 0
     for i in range(ng):
         for j in range(nw):
-            _, _, gp, gpp, _inten, r, mu = out[idx]
+            _, _, gp, gpp, _inten, r, mu, cflag = out[idx]
             G1p[i, j] = gp; G1pp[i, j] = gpp; resid[i, j] = r
+            conv[i, j] = cflag
             if mu is not None:
                 floq[i, j] = mu
             idx += 1
-    return LAOSMap(alpha, g0s, ws, G1p, G1pp, resid, floq)
+
+    n_bad = int((~conv).sum())
+    if n_bad:
+        warnings.warn(
+            f"{n_bad} of {conv.size} LAOS point(s) did not converge (relative "
+            f"cycle-closure error > 1e-3); see the returned `converged` array. "
+            f"These are typically at small amplitude or near alpha_c -- consider "
+            f"sweep.amplitude_sweep / sweep.omega_sweep (continuation) or more "
+            f"steps_per_period.", RuntimeWarning, stacklevel=2)
+    return LAOSMap(alpha, g0s, ws, G1p, G1pp, resid, floq, conv)
+
+
+# --------------------------------------------------------------------------
+# continuation sweeps (sequential, warm-started -- robust at small amplitude
+# and near alpha_c, where independent solves of the period map struggle)
+# --------------------------------------------------------------------------
+@dataclass
+class LAOSSweepResult:
+    alpha: float
+    gamma0: np.ndarray        # amplitude(s)
+    omega: np.ndarray         # frequency(ies)
+    G1p: np.ndarray           # first-harmonic storage modulus, aligned to the swept axis
+    G1pp: np.ndarray          # first-harmonic loss modulus
+    residual: np.ndarray
+    converged: np.ndarray     # per-point convergence flag (rel. error <= 1e-3)
+    method: list
+
+
+def amplitude_sweep(alpha: float, gamma0s, omega: float, grid: Grid | None = None,
+                    P_init=None, descending: bool = True,
+                    **solver_opts) -> LAOSSweepResult:
+    """LAOS amplitude sweep at fixed ``omega`` using continuation between amplitudes.
+
+    Amplitudes are solved sequentially, each warm-started from the previous
+    converged cycle.  This is far more robust and faster than independent solves
+    (e.g. ``laos_map``) at small amplitude or near alpha_c, where the period map
+    is ill-conditioned and a cold-started Newton-Krylov stalls.  By default the
+    sweep runs from large to small amplitude (``descending=True``), starting
+    where convergence is easiest; the first point uses ``solve_laos``'s default
+    physically-motivated seed unless ``P_init`` is supplied.  Results are returned
+    aligned to the input ``gamma0s`` order.  Extra keyword arguments are forwarded
+    to ``solve_laos`` (e.g. ``steps_per_period``, ``tol``, ``method``, ``verbose``).
+    """
+    if grid is None:
+        grid = Grid()
+    g0s = np.atleast_1d(np.asarray(gamma0s, dtype=float))
+    order = np.argsort(g0s)[::-1] if descending else np.argsort(g0s)
+    P = None if P_init is None else np.asarray(P_init, dtype=float)
+    Gp = np.empty(g0s.size); Gpp = np.empty(g0s.size)
+    resid = np.empty(g0s.size); conv = np.empty(g0s.size, dtype=bool)
+    meth = [None] * g0s.size
+    for idx in order:
+        r = solve_laos(alpha, float(g0s[idx]), float(omega), grid, P_init=P,
+                       **solver_opts)
+        P = r.P0
+        Gp[idx] = r.G1_prime; Gpp[idx] = r.G1_doubleprime
+        resid[idx] = r.residual; conv[idx] = r.converged; meth[idx] = r.method
+    return LAOSSweepResult(alpha, g0s, np.atleast_1d(float(omega)),
+                           Gp, Gpp, resid, conv, meth)
+
+
+def omega_sweep(alpha: float, gamma0: float, omegas, grid: Grid | None = None,
+                P_init=None, descending: bool = True,
+                **solver_opts) -> LAOSSweepResult:
+    """LAOS frequency sweep at fixed amplitude ``gamma0`` using continuation.
+
+    Frequencies are solved sequentially, each warm-started from the previous
+    converged cycle.  By default the sweep runs from high to low frequency
+    (``descending=True``), starting from the easily-converged high-frequency end;
+    the first point uses ``solve_laos``'s default seed unless ``P_init`` is given.
+    Results are returned aligned to the input ``omegas`` order.  Extra keyword
+    arguments are forwarded to ``solve_laos``.
+    """
+    if grid is None:
+        grid = Grid()
+    ws = np.atleast_1d(np.asarray(omegas, dtype=float))
+    order = np.argsort(ws)[::-1] if descending else np.argsort(ws)
+    P = None if P_init is None else np.asarray(P_init, dtype=float)
+    Gp = np.empty(ws.size); Gpp = np.empty(ws.size)
+    resid = np.empty(ws.size); conv = np.empty(ws.size, dtype=bool)
+    meth = [None] * ws.size
+    for idx in order:
+        r = solve_laos(alpha, float(gamma0), float(ws[idx]), grid, P_init=P,
+                       **solver_opts)
+        P = r.P0
+        Gp[idx] = r.G1_prime; Gpp[idx] = r.G1_doubleprime
+        resid[idx] = r.residual; conv[idx] = r.converged; meth[idx] = r.method
+    return LAOSSweepResult(alpha, np.atleast_1d(float(gamma0)), ws,
+                           Gp, Gpp, resid, conv, meth)
