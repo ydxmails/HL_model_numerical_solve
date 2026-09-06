@@ -310,6 +310,251 @@ with a single relaxation time $\tau_{\rm relax}$ that diverges as $\alpha \to
 high frequency the material has no time to flow and responds elastically,
 $G' \to G_0 = 1$. The SAOS solver reproduces all of this (`tests/test_saos_laos.py`).
 
+**The distribution of yield stresses.** A quantity the package reads straight off
+any steady state is the distribution of the local stress $\sigma_{\rm ac}$ a block
+carries *at the instant it yields*. Because HL yields at a **flat** rate
+$1/\tau = 1$ everywhere above threshold, the rate of yield events occurring at
+stress $\sigma$ (per unit $\sigma$, per unit time) is just
+$\tfrac{1}{\tau}H(|\sigma|-1)P(\sigma) = H(|\sigma|-1)P(\sigma)$. Normalising by the
+total yield rate $\Gamma = \int_{|\sigma|>1}P\,d\sigma$ gives
+
+$$
+\rho_{\rm ac}(\sigma) = \frac{H(|\sigma|-1)\,P(\sigma)}{\Gamma},
+$$
+
+supported on $|\sigma| > 1$ — as it must be, since a block below threshold cannot
+yield — with unit integral. The flat rate is exactly what makes this equal to the
+*normalised over-threshold population*; a stress-dependent yield rate $k(\sigma)$
+would instead weight $P$ by $k(\sigma)$.
+
+*Quiescent liquid.* Here $\rho_{\rm ac}$ is closed-form. The over-threshold part of
+the base state is $P(\sigma) = c\,e^{-(\sigma-1)/\sqrt D}$ (§4), so dividing by
+$\Gamma = 2c\sqrt D$ collapses the tails onto a pure two-sided exponential,
+
+$$
+\rho_{\rm ac}(\sigma) = \frac{1}{2\sqrt D}\,e^{-(|\sigma|-1)/\sqrt D},
+\qquad |\sigma| > 1.
+$$
+
+The overshoot past threshold $x = |\sigma_{\rm ac}| - 1$ is therefore exponentially
+distributed with mean (and standard deviation) $\sqrt D$. Clean reading: a block
+above threshold random-walks with diffusivity $D$ while being absorbed at rate $1$,
+so it penetrates a distance $\sqrt{D/1} = \sqrt D$ before yielding — the
+stress-diffusion length *is* the mean yield overshoot.
+
+*Steady shear.* With drift the far-tail equation becomes
+$D P'' - \dot\gamma P' - P = 0$, whose decaying solutions stay exponential but with
+**direction-dependent** rates (the roots of $D\lambda^2 - \dot\gamma\lambda - 1 =
+0$):
+
+$$
+\ell_+ = \frac{2D}{\sqrt{\dot\gamma^2 + 4D} - \dot\gamma}\ \ (\sigma > 1),
+\qquad
+\ell_- = \frac{2D}{\sqrt{\dot\gamma^2 + 4D} + \dot\gamma}\ \ (\sigma < -1).
+$$
+
+The downstream tail (the direction shear pushes) is the fatter one, $\ell_+ >
+\ell_-$, so more blocks yield further past $+1$ than past $-1$: the asymmetry of
+$\rho_{\rm ac}$ is a direct fingerprint of the flow direction. Both lengths reduce
+to $\sqrt D$ as $\dot\gamma \to 0$, recovering the quiescent result.
+
+*Steady oscillation.* Under a periodic drive $\rho_{\rm ac}$ breathes within the
+cycle: at any single phase it is asymmetric, following the instantaneous strain
+rate $\dot\gamma(t) = \gamma_0\omega\cos\omega t$. The **period-averaged**,
+event-weighted distribution
+
+$$
+\bar\rho_{\rm ac}(\sigma) = \frac{\displaystyle\int_0^T P(\sigma,t)\,H(|\sigma|-1)\,dt}
+{\displaystyle\int_0^T \Gamma(t)\,dt}
+$$
+
+is the oscillatory analogue of the steady-shear $\rho_{\rm ac}$; the sine drive's
+half-period symmetry $(\sigma, t) \to (-\sigma,\, t + T/2)$ forces it to be
+**symmetric** in $\sigma$, even though every instantaneous slice is not.
+
+In the code, `yield_stress_distribution(P, grid)` builds $\rho_{\rm ac}$ from any
+distribution — a steady state (`SteadyResult.yield_stress_distribution()`), a
+period average, or a single phase slice — since it renormalises by $\Gamma$
+internally. For LAOS, `solve_laos(..., yield_phases=k)` attaches a
+`CycleYieldDistribution` (the period average, plus $k$ phase-resolved slices) to
+the result. The exponential mean, the sheared lengths $\ell_\pm$, and the
+period-average symmetry are checked in `tests/test_yield_distribution.py`. (In the
+jammed, frozen quiescent state $\Gamma = 0$ and $\rho_{\rm ac}$ is genuinely
+undefined — nothing yields — which the code flags rather than dividing by zero.)
+
+**The residence-time (age-at-yield) distribution.** If $\rho_{\rm ac}$ answers
+*where* a block yields, the natural companion asks *when*: tag a block the instant
+it is reborn at $\sigma = 0$ and follow it until it yields. In the self-consistent
+steady background it drifts at $\dot\gamma$, diffuses with noise $D$, and is
+absorbed at rate $1/\tau = 1$ whenever $|\sigma| > 1$. The distribution of its age
+$a$ at yielding is the absorption-time density of a cohort launched from
+$\sigma = 0$ into the model's generator **without the reinjection source** (a
+tagged block is not re-added when *others* yield):
+
+$$\partial_a Q = -\dot\gamma\,\partial_\sigma Q + D\,\partial^2_\sigma Q
+- H(|\sigma|-1)\,Q,\qquad Q(\sigma,0)=\delta(\sigma),$$
+
+with survival $S(a)=\int Q\,d\sigma$ and age-at-yield density
+$\psi(a)=-\,dS/da=\int H(|\sigma|-1)\,Q\,d\sigma$. Two exact relations follow:
+
+- *The steady state is the age-integral of the cohort.* Since
+  $\int_0^\infty\partial_a Q\,da=-\delta(\sigma)$ reproduces the stationary
+  equation, $P(\sigma)=\Gamma\int_0^\infty Q(\sigma,a)\,da$ — the stationary
+  distribution is all cohort ages superposed, weighted by the rebirth rate.
+- *The mean is $1/\Gamma$.* By Little's law (one block, $\int P = 1$, reborn at
+  rate $\Gamma$), $\langle a\rangle = 1/\Gamma = \alpha/D$. Equivalently a single
+  block yields at time-averaged rate $1\times$ (fraction of time over threshold)
+  $=\Gamma$, so its mean time between yields is $1/\Gamma$.
+
+*Shape.* $\psi(a)$ rises from zero — there is a lag while the block must first
+reach $|\sigma|=1$ — then decays exponentially with rate equal to the **spectral
+gap of the no-source generator** $D L_2 + A + \text{Yield}$. At low rate escape is
+diffusion-limited (a pronounced hump, slow tail); at high rate advection sweeps the
+block to threshold almost immediately, the response becomes nearly memoryless
+(exponential), and the tail rate saturates at the bare yielding rate
+$1/\tau = 1$. Higher rate raises $\Gamma$, so the mean $1/\Gamma$ shrinks.
+
+*Oscillation.* Here the background $D(t)=\alpha\Gamma(t)$ and $\dot\gamma(t)$ are
+the limit-cycle values, so the residence time depends on the **birth phase**: a
+block born at maximum strain rate is advected straight toward threshold and yields
+sooner, while one born at the turning point ($\dot\gamma=0$) must wait for the rate
+to rebuild and yields later. Averaging over birth phases weighted by the rebirth
+rate $\Gamma(t_0)$ gives the cycle density, whose mean is exactly $1/\langle\Gamma
+\rangle$ (with $\langle\Gamma\rangle$ the cycle-mean rate); the mean-vs-birth-phase
+curve has period $T/2$ by the half-period symmetry.
+
+In the code, `residence_time_distribution(alpha, gammadot, grid)` integrates the
+cohort (Crank–Nicolson, no source) and returns $\psi(a)$, $S(a)$, the occupation
+density $R(\sigma)=\int Q\,da$ (so $\Gamma R = P$), and the mean; the optional
+`compute_gap` returns the tail rate. `cycle_residence_time_distribution(...)` does
+the oscillatory phase-average and birth-phase-resolved densities. The exact mean
+$1/\Gamma$, the identity $P=\Gamma\int Q\,da$, the high-shear tail rate $1$, and the
+oscillatory $1/\langle\Gamma\rangle$ are checked in `tests/test_residence.py`. In
+the jammed quiescent state $\Gamma = 0$: the residence time is infinite — blocks
+never yield — which *is* the glass. Steady shear always restores a finite value;
+oscillation does so only above the yield strain (amplitude $\gamma_0 \gtrsim
+\sigma_y$), since below it the material barely yields and the distribution is
+ill-defined — the code flags this (`defined=False`, with a warning) rather than
+returning a spuriously capped curve.
+
+**The non-affine stress trajectory before yield.** The residence cohort also answers
+a different question about a single element: not just *when* or *where* it yields,
+but *how its stress evolves in between*, split into an affine and a non-affine part.
+
+*Affine vs non-affine.* When the material is sheared, a block's stress rises at
+exactly the strain rate, $\dot\sigma = \dot\gamma$ — this is **affine**: the block
+deforms elastically with the imposed strain, reversibly, carrying no plasticity. It
+is precisely the advection term $-\dot\gamma\,\partial_\sigma P$. Everything else is
+**non-affine**: the diffusive kicks a block receives when *other* blocks yield and
+redistribute stress (the $D\,\partial^2_\sigma$ term), and the block's own plastic
+reset. "Subtracting the affine displacement" therefore means *removing the
+advection*. Exactly: change to the **co-deforming stress variable**
+$\xi = \sigma - \gamma(t)$; the advection cancels identically and the equation
+becomes
+
+$$\partial_t \tilde P = D\,\partial^2_\xi \tilde P
+- H\big(|\xi + \gamma(t)| - 1\big)\,\tilde P + \Gamma\,\delta(\xi + \gamma(t)),$$
+
+pure diffusion plus a yield threshold and source that now *move* at $-\gamma(t)$. In
+this frame a block's stress does a **driftless random walk** — the non-affine
+motion — and yields when the oscillating threshold sweeps over it. Sampling
+stroboscopically at $t = nT$ (where $\gamma = 0$, so $\xi = \sigma$) is the special
+case of this exact transform at integer periods.
+
+*What we measure.* Launch the same no-source cohort $Q(\sigma, a)$ as above (a block
+reborn at $\sigma = 0$, followed in its age $a$ without reinjection). Among the
+survivors — blocks that have not yet yielded by age $a$ — read the conditional stress
+moments and split off the non-affine part,
+
+$$\langle\sigma\rangle_{\rm surv}(a) = \frac{\int \sigma\,Q\,d\sigma}{\int Q\,d\sigma},
+\qquad
+\text{non-affine mean} = \langle\sigma\rangle_{\rm surv}(a) - \sigma_{\rm aff}(a),$$
+$$\text{non-affine MSD} = \big\langle(\sigma - \sigma_{\rm aff})^2\big\rangle_{\rm surv}(a),$$
+
+where the affine loading is $\sigma_{\rm aff}(a) = \dot\gamma\,a$ under steady shear,
+and $\sigma_{\rm aff}(a;t_0) = \gamma_0[\sin\omega(t_0+a) - \sin\omega t_0]$ for a
+cohort born at phase $t_0$ under oscillation (the accumulated affine strain since
+birth).
+
+*Two clean limits.* At **short age**, before any block has had time to reach
+threshold, there is no absorption and the walk is free: the non-affine MSD grows
+diffusively,
+
+$$\big\langle(\sigma - \sigma_{\rm aff})^2\big\rangle \;\to\; 2D\,a
+\qquad (a \to 0),$$
+
+so the mean-square non-affine stress displacement is a direct readout of the
+self-generated mechanical noise $D = \alpha\Gamma$. At **longer age**, absorption at
+$|\sigma| = 1$ truncates the spread — the un-yielded population cannot cross the
+threshold — so the MSD saturates at a stress-space **cage** size. Meanwhile the
+survivor mean tracks the affine line $\dot\gamma a$ at first, then bends *below* it
+and plateaus: a surviving block is precisely one whose non-affine kicks kept it from
+riding the affine ramp up to $+1$ and yielding, so at long age the non-affine mean
+tends to $-\sigma_{\rm aff}$ (the survivor stress stops rising). Slow shear is
+**non-affine-dominated** (large diffusive spread, mean near zero, long residence);
+fast shear is **affine-dominated** (the block is swept to threshold and yields before
+non-affine motion matters).
+
+*Exact cross-checks.* Because the steady state is the age-integral of the cohort,
+$P(\sigma) = \Gamma\int_0^\infty Q\,da$, the macroscopic stress is the rebirth rate
+times the age-integrated survivor stress moment,
+
+$$\Sigma = \Gamma\int_0^\infty m_1(a)\,da, \qquad m_1(a) = \int \sigma\,Q(\sigma,a)\,d\sigma,$$
+
+which the code reproduces to machine precision — a direct tie of the single-element
+non-affine trajectory to the measured macroscopic stress. The short-age slope equals
+$2D$; and under oscillation the sine drive's half-period symmetry makes the cohorts
+born at $t_0$ and $t_0 + T/2$ mirror images, so their non-affine MSDs coincide and
+their non-affine means are opposite — a free numerical check that sits at
+$\sim 10^{-9}$.
+
+In the code, `nonaffine_stress_trajectory(alpha, gammadot, grid)` integrates the
+steady cohort and returns the survivor mean, the affine loading, the non-affine mean
+and MSD, the free-diffusion reference $2Da$, and the survival $S(a)$.
+`cycle_nonaffine_stress_trajectory(...)` does the oscillatory version — subtracting
+the affine part via the co-deforming transform for each birth phase, and returning
+the birth-phase-resolved trajectories together with their rebirth-weighted average.
+The free-diffusion slope, the $\Sigma = \Gamma\int m_1\,da$ identity, and the
+half-period symmetry are checked in `tests/test_residence.py`. (In the frozen jammed
+state $\Gamma = 0$ there is no absorption, the element just loads affinely, and the
+non-affine motion is trivial — flagged `defined=False`.)
+
+**The yield-phase distribution: when in the cycle a block breaks.** The residence
+density $\psi(a;t_0)$ is a *duration* — the age from rebirth to yield, for a block
+born at phase $t_0$. Under oscillation there is a second, complementary question:
+not *how long* the block lasts, but *at what phase of the cycle* it yields. A block
+born at $t_0$ that survives age $a$ yields at absolute time $t_0+a$, hence at cycle
+phase $(t_0+a)\bmod T$. Because a block typically survives several periods, its
+yield lands in one of many periods that all map to the same phase, so the yield-phase
+density is $\psi$ *folded onto one period*:
+
+$$\rho_{\rm yield}(\varphi\mid t_0) \;=\; \sum_{j\ge 0}\ \psi\!\big(((\varphi-t_0)\bmod T)+jT\ ;\ t_0\big).$$
+
+The lifetime density $\psi(a;t_0)$ is not monotone: it carries a bump near every
+strain extremum, because a block reborn at zero stress loads toward threshold and is
+most likely to break when the drive next reaches a peak — roughly half a period after
+birth, then one, then one-and-a-half, all under a decaying survival envelope. Folding
+those bumps onto one period collapses them into a **bimodal** yield-phase
+distribution peaked at the two strain extrema (where $|\sigma|$ is largest).
+
+There is a clean consistency check built in. If instead of conditioning on one birth
+phase we aggregate over *all* births — each weighted by its rebirth rate
+$\Gamma(t_0)$ — the folded distributions must sum to the **instantaneous yield rate**
+$\Gamma(\varphi)/\langle\Gamma\rangle$ read straight off the converged cycle, because
+by definition the rate of yield events at phase $\varphi$ *is* $\Gamma(\varphi)$. The
+code reproduces this to about a percent. And since the sine drive gives $\Gamma$
+period $T/2$ (from the half-period symmetry $P(\sigma,t{+}T/2)=P(-\sigma,t)$), the
+aggregate is invariant under $\varphi\to\varphi+T/2$. In steady shear there is no
+phase — $\psi(a)$ *is* the yield-time distribution up to a birth-time shift — so this
+object is purely a consequence of the periodic clock.
+
+In the code, `cycle_yield_phase_distribution(alpha, gamma0, omega, grid)` folds the
+birth-phase-resolved $\psi$ (reusing `cycle_residence_time_distribution`) and returns
+the phase axis, the per-birth-phase densities `rho_by_phase`, their rebirth-weighted
+aggregate `rho`, and the instantaneous rate `yield_rate` $=\Gamma(\varphi)/\langle\Gamma\rangle$
+as an independent cross-check. The aggregate identity, the normalisations, and the
+half-period symmetry are verified in `tests/test_residence.py`.
+
 ---
 
 ## Part II — Turning the PDE into something a computer can solve
@@ -461,21 +706,77 @@ becomes advection-dominated, and the distribution develops sharp fronts as it is
 pushed against the threshold at $\pm 1$. Upwinding stays **monotone** (no spurious
 oscillations) there. The price is a small amount of artificial smearing, called
 **numerical diffusion**, which behaves like an extra diffusion of size
-$\sim |\dot\gamma| h / 2$. We keep it under control by refining the grid (smaller
-$h$) and by cross-checking against the analytic steady and SAOS solvers, which
-have no such error. The code's advection matrix is sign-aware (so it works when
-$\dot\gamma$ changes sign during an oscillation) and uses no-flux ends, preserving
-conservation.
+
+$$D_{\text{num}} \simeq |\dot\gamma|\, h / 2 .$$
+
+**Why that price is unaffordable in this model, and what we do instead.** In an
+ordinary advection–diffusion solver $D_{\text{num}}$ is a benign $O(h)$
+truncation error. Here it is not, because HL's own state variable *is* a
+diffusivity: the closure $D = \alpha\Gamma$ means numerical smearing is
+dimensionally and physically **indistinguishable from the physics being
+measured**, and it manufactures spurious yielding. Under steady shear this stays
+invisible — the physical $D \sim \dot\gamma/2$ exceeds $D_{\text{num}}$ by a
+factor $1/h$ — but in small-amplitude oscillation the physical activity vanishes
+far faster ($\bar D \sim \gamma_0^{2.7}$) than the numerical floor ($\sim
+\gamma_0$), so below $\gamma_0 \approx 0.1$ the floor takes over. It also
+destroys the model's absorbing state: $D = 0$ is an exact fixed point of the
+continuum dynamics, but *not* of the upwind discretisation.
+
+The package therefore advects with a conservative **van Leer flux-limited (TVD)**
+scheme, which is second order where $P$ is smooth and reverts to upwind only near
+extrema — so it keeps monotonicity and positivity at the fronts while removing
+the diffusive floor (measured: ~65× less spurious spreading in a pure-translation
+test).
+
+Because the limiter is solution-dependent, the flux cannot go into a linear
+implicit operator directly. **Both** engines handle this the same way — *defect
+correction*, not operator splitting: the monotone upwind operator stays implicit
+and the difference between the two flux divergences is carried explicitly. The
+payoff is that the time-stepper's fixed point is *exactly* the stationary
+solver's equation, so the transient still relaxes to the direct solver's answer
+to round-off at any $\Delta t$ — the cross-check that validates the package
+survives the change. (Strang splitting would have degraded it to $O(\Delta t)$.)
+The legacy first-order operator remains available as `advection="upwind"` in
+both, for comparison.
+
+Constructions that need a genuine *linear* generator — the cohort and
+first-passage machinery in `residence.py` and `elastic_ratio.py`, whose
+identities such as $P = \Gamma\int_0^\infty Q\,da$ rely on linearity, since
+$\int A(Q)\,da \neq A(\int Q\,da)$ — use `advection_matrix_frozen`: the van Leer
+limiter is scale-invariant, so freezing it at the steady state gives a linear,
+mass-conserving, tridiagonal matrix that reproduces the TVD flux there exactly.
+The one exception is the survivor-conditioned non-affine trajectory, which
+divides by an exponentially small survival and therefore needs a *monotone*
+operator; it stays on upwind deliberately (the two agree to ~1% wherever the
+ratio is meaningful).
+
+Note in particular that the steady solver is **not** an independent oracle for
+this error: it is built from the same advection operator, so it shares whatever
+numerical diffusion that operator carries.
 
 **Yielding.** This term is local — each over-threshold bin loses probability at
 rate $1$, independently of its neighbours — so it is a diagonal matrix: entry
-$-1$ on nodes with $|\sigma_i| > 1$, and $0$ elsewhere (including exactly at
-$\pm 1$, per the $H(0) = 0$ convention).
+$-1$ on nodes with $|\sigma_i| > 1$, and $0$ strictly inside.
+
+The nodes sitting exactly *at* $\pm 1$ need care. Landing $\pm 1$ on grid nodes
+is necessary but not sufficient: with rectangle-rule weights, a hard cut that
+excludes those nodes integrates the yielding region from $1 + h/2$ instead of
+from $1$, which biases $\Gamma$ — and hence, through the closure, the entire
+solution — at $O(h)$. We therefore give the two threshold nodes weight
+$\tfrac12$, the trapezoidal edge, which is $O(h^2)$. This is `Grid.yield_weight`.
+
+Both corrections are needed together: with the hard edge the scheme is first
+order no matter how good the advection, and with upwind advection it is first
+order no matter how good the edge. With TVD *and* the half-weighted edge the
+steady stress converges at the observed rate $p = 2.00$, and its error at
+$n_{\text{per unit}} = 200$ drops by an order of magnitude.
 
 **Source.** Reinjection deposits all the yielded probability at $\sigma = 0$. The
 Dirac delta $\delta(\sigma)$ on the grid becomes a spike of height $1/h$ at the
 zero node (so that $h \times 1/h = 1$, i.e. its discrete integral is one). Its
-strength is the yielding rate $\Gamma = h\sum_{|\sigma_i|>1} P_i$. The result is a
+strength is the yielding rate $\Gamma = h\sum_i w_i P_i$ with the same weights
+$w$ used by the loss term — using the same weights on both sides is what keeps
+the discrete mass balance exact. The result is a
 matrix with a single non-trivial row (the zero-node row), which reads off the
 total over-threshold probability and dumps it at the origin. Conveniently the
 factor $h$ from the integral and the $1/h$ from the discrete delta cancel, so the
@@ -832,6 +1133,21 @@ multiplier crossing the unit circle would flag a bifurcation away from simple
 $T$-periodicity (e.g. period doubling at extreme amplitude), so the method is
 self-diagnosing.
 
+**Sampling the cycle: a stride that must divide.** The harmonic projection
+assumes its samples tile $[0, T)$ uniformly with the endpoint excluded, so that the
+rectangle sum over one period is spectrally accurate. The period map records every
+`rec`-th step, with `rec` chosen to hit a target sample count — and if `rec` does
+*not* divide the step count, the final gap differs from all the others and the
+projection aliases. This is a nasty failure because it is quiet: at $\omega = 0.3$
+with $600$ steps per period the even-harmonic content sits at $10^{-11}$, but at
+$800$ steps (stride $3$, remainder $2$) it jumps to $1.9\times10^{-3}$ and the
+$G''$ convergence sequence stops being monotone. Refining the time step made the
+answer *worse*. The fix is to snap `rec` down to the nearest divisor of the step
+count, which costs at most a few extra samples. It is worth stating the general
+lesson: an error diagnostic is only trustworthy while the machinery that computes
+it is itself correct, and here the diagnostic and the quantity it was checking
+were corrupted by the same line of code.
+
 **Harmonic balance (an efficient alternative, not yet implemented).** When the
 response is smooth, one can avoid time stepping entirely by expanding
 $P(\sigma, t) = \sum_n \hat P_n(\sigma)\,e^{i n\omega t}$ in a few Fourier
@@ -840,7 +1156,158 @@ balance** method is typically the most efficient route for moderate LAOS; it
 degrades only when the Lissajous response sharpens enough to need many harmonics.
 It is noted here as natural future work; v0.1 uses the period-map solvers above.
 
-### 13. Doing many runs at once: parallelism
+### 13. Parallel superposition: oscillation on top of steady shear
+
+So far the drive has been either steady ($\dot\gamma$ constant) or purely
+oscillatory ($\gamma = \gamma_0\sin\omega t$). A natural experiment combines them:
+hold a steady shear and superpose a small oscillation, to probe how the *flowing*
+material responds rather than the quiescent one.
+
+Experimentally there are two ways to do this. **Orthogonal** superposition applies
+the oscillation perpendicular to the base flow; **parallel** superposition applies
+it collinearly. HL is a scalar model — there is one stress variable $\sigma$ and no
+notion of direction — so only the parallel protocol can be represented:
+
+$$\gamma(t) = \dot\gamma_0 t + \gamma_A\sin\omega t, \qquad
+  \dot\gamma(t) = \dot\gamma_0 + \gamma_A\omega\cos\omega t.$$
+
+**The substitution is exact, and it is the whole modification.** Replacing
+$\dot\gamma$ by $\dot\gamma_0 + \gamma_A\omega\cos\omega t$ in the Fokker–Planck
+equation is not an approximation, for two reasons. First, the elastic loading term
+comes from $\dot\sigma = G_0\dot\gamma$ for a block that has not yet yielded, which
+is *linear* in $\dot\gamma$; the steady and oscillatory contributions therefore add
+with no cross term. All the nonlinearity of the model lives in the closure
+$D = \alpha\Gamma$ and in the yielding term, neither of which sees $\dot\gamma$ at
+all. Second, the accumulated strain $\gamma$ appears nowhere in the dynamics — only
+its rate does. So superposing the *drives* is exact even though the response is
+strongly nonlinear.
+
+**The limit cycle survives.** That second point does more work than it looks.
+Under superposition the strain grows without bound, $\gamma(t)\to\infty$, so one
+might expect no periodic state to exist. But the equation never sees $\gamma$; it
+sees only $\dot\gamma(t)$, which *is* $T$-periodic. The distribution therefore still
+settles onto a genuine limit cycle $P(\sigma, t) = P(\sigma, t + T)$, and the entire
+period-map machinery of §12 — Picard, Newton–Krylov, the mass-pinned residual, the
+Floquet multiplier — applies unchanged. Only the drive function differs. (Contrast a
+model with explicitly strain-dependent terms, where an unbounded $\gamma$ would be a
+genuine obstruction.)
+
+**One regime parameter, not three.** In reduced units $\dot\gamma_0$, $\omega$ and
+$\gamma_A$ are already dimensionless (the yield strain is $1$), so all three are
+independent knobs. But what organises the *behaviour* is their combination
+
+$$\Lambda = \frac{\gamma_A\omega}{\dot\gamma_0},$$
+
+the ratio of peak oscillatory rate to steady rate. Since
+$\dot\gamma_{\min} = \dot\gamma_0(1 - \Lambda)$, the flow merely pulses without
+reversing when $\Lambda < 1$, and reverses within each cycle when $\Lambda > 1$.
+The strain turning points sit at $\cos\omega t = -1/\Lambda$, *not* at $T/4$ and
+$3T/4$ as they do for a pure sine — which is why measures built around the
+sine's quarter-period structure (recoverable strain, §5) do not carry over
+without generalisation.
+
+**There is no passive probe here.** This is the physically important caveat, and
+it is a direct consequence of the model being scalar. An orthogonal probe would
+perturb the *magnitude* of the strain rate only in quadrature,
+$|\dot\gamma| = \sqrt{\dot\gamma_0^2 + \delta\dot\gamma^2}
+ \approx \dot\gamma_0 + \delta\dot\gamma^2/2\dot\gamma_0$, i.e. at
+$O(\gamma_A^2)$. A collinear probe perturbs it at $O(\gamma_A)$. Because the HL
+closure routes everything through the single scalar $\Gamma$, that first-order
+perturbation modulates the noise $D = \alpha\Gamma$ directly: the oscillation
+*fluidises* the material. What one measures is therefore always the response of a
+new, rejuvenated state, never of the steady state at $\dot\gamma_0$. This is real
+physics — it is the model's version of shear rejuvenation — but it means the
+protocol should be read as a treatment as much as a measurement.
+
+**The symmetry is broken, and with it the free error check.** Under a pure sine the
+model has the half-period symmetry $(\sigma, t)\to(-\sigma, t + T/2)$, which forces
+all even harmonics of the stress to vanish; §12 uses their residual size as a free
+accuracy diagnostic. That symmetry requires
+$\dot\gamma(t + T/2) = -\dot\gamma(t)$, which fails for any $\dot\gamma_0\ne0$.
+Even harmonics are therefore **physical** under superposition, not error. Their
+normalised amplitude is $O(\gamma_A)$ — that is, $O(\gamma_A^2)$ in the stress
+itself — and, interestingly, they are non-monotonic in $\Lambda$: they peak near
+$\Lambda\sim2$ and decay again as $\Lambda\to\infty$, because a very large
+oscillation makes the steady drift a small bias and asymptotically restores the
+symmetry. That makes the second-harmonic intensity a natural order parameter for
+the reversal crossover. It also means the diagnostic of §12 is unavailable, and
+accuracy must be established by Richardson extrapolation in $\Delta t$ together
+with the Floquet multiplier.
+
+**The linear response: an oracle for small $\gamma_A$.** As with SAOS, we need not
+simulate anything in time when the oscillation is small — we linearise. The
+difference is only that we now linearise about the *sheared* steady state
+$P_s(\sigma;\dot\gamma_0)$ with its self-consistent $D_s = \alpha\Gamma_s$, rather
+than about the quiescent state. Writing
+$P = P_s + \operatorname{Re}[P_1 e^{i\omega t}]$ and keeping first order, the
+normalised amplitude $p_1 = P_1/\gamma_A$ satisfies
+
+$$(i\omega I - \mathcal G_{\rm lin})\,p_1 = -\omega\,\partial_\sigma P_s, \qquad
+  \mathcal G_{\rm lin} = D_s L_2 + A(\dot\gamma_0) + \text{Yield} + \text{Source}
+  + \alpha\,(L_2 P_s)(h\,\text{mask})^{\mathsf T}.$$
+
+Compare this with the SAOS operator of §11: there are exactly two differences. The
+tridiagonal block now carries advection bands, and the base state is sheared.
+Everything else — including the crucial fact that Source and the linearised noise
+feedback share the same $\text{mask}^{\mathsf T}$ row, so the whole correction is
+rank one — is unchanged. Sherman–Morrison therefore still applies, and the cost is
+still two complex tridiagonal solves per frequency.
+
+Two implementation choices matter. The advection block uses the van Leer limiter
+**frozen at $P_s$** (§8). That operator was built for exactly this: it is linear
+and tridiagonal, and it satisfies $A P_s = $ `advection_tvd_rhs`$(P_s)$ *exactly*,
+so the linearisation is taken about the same discrete stationary equation the
+steady solver actually solved, rather than about a first-order proxy for it. The
+forcing reuses the same flux: since $A(v)$ is linear in $v$ at fixed sign, the
+discrete $-\omega\,\partial_\sigma P_s$ is
+$(\omega/\dot\gamma_0)\,$`advection_tvd_rhs`$(P_s, \dot\gamma_0)$. (SAOS instead
+uses a centred `np.gradient`, which is the right choice *there* precisely because
+the quiescent base state carries no advection operator to stay consistent with.)
+
+**An exact identity, useful as a check.** Every block of $\mathcal G_{\rm lin}$ has
+zero column sums — including the rank-one feedback term, since $L_2 P_s$ itself
+sums to zero — so $\mathbf 1^{\mathsf T}\mathcal G_{\rm lin} = 0$. The forcing is a
+flux divergence, so $\mathbf 1^{\mathsf T} f = 0$ too. Hence
+$i\omega\,\mathbf 1^{\mathsf T}p_1 = 0$: the perturbation carries **no mass**, as it
+must, since the total probability is pinned at one. Measured at $10^{-13}$ or
+below, this is a sharp and completely free check on the whole construction.
+
+**Negative storage moduli.** Parallel superposition has a long-standing reputation
+in the experimental literature for producing storage moduli that go negative at low
+frequency, in apparent violation of the usual expectations for a linear modulus. HL
+reproduces this. Deep in the jammed phase at low shear rate — $\alpha = 0.3$,
+$\dot\gamma_0 = 0.01$, where the flow curve is strongly thinning — $G'_\parallel$ is
+negative for $\omega\lesssim0.08$, dipping to about $-0.025$, while
+$G''_\parallel$ stays positive throughout; at $\alpha = 0.8$ it is positive
+everywhere. Because this comes out of an exact linear-response solve about a
+well-defined non-equilibrium steady state, with the mass identity above holding to
+$10^{-13}$, it is neither an experimental artifact nor a numerical one: within this
+model it is a genuine property of linear response about a shear-thinning state.
+
+**Two observables with very different numerical character.** The cycle-mean stress
+$\bar\Sigma$ (the $n=0$ Fourier coefficient) sits below the unperturbed steady
+stress $\Sigma_s(\dot\gamma_0)$ by an $O(\gamma_A^2)$ amount: this is the
+oscillation-induced thinning, and it is the most direct expression of the
+fluidisation described above. Remarkably, it is almost independent of the time
+step — measured to move by under $2\%$ across a fourfold change in $\Delta t$ —
+because the mass-conserving IMEX scheme reproduces cycle *averages* far better than
+instantaneous waveforms. The first-harmonic moduli, by contrast, carry the
+integrator's full $O(\Delta t)$ error. The practical consequence is that a
+fluidisation map over $(\dot\gamma_0, \gamma_A, \omega)$ can be computed cheaply at
+coarse resolution, while moduli either need fine time steps or should be taken from
+the linear oracle above.
+
+**A conditioning bonus.** Small-amplitude LAOS in the jammed phase is the package's
+hardest regime: the material barely yields, the period map is close to the identity,
+and convergence slows critically. Superposition cures this. The steady drift keeps
+the material fluidised, so the dominant Floquet multiplier is small — typically
+$10^{-3}$ or less across the whole $(\gamma_A, \omega)$ map — and the fixed point
+converges in a few tens of period solves. Seeding matters here: because the drive
+has a nonzero mean rate, the natural starting guess is the sheared steady state
+rather than the quiescent base state, and using the latter would waste most of the
+iterations undoing it.
+
+### 14. Doing many runs at once: parallelism
 
 Each individual solve above is cheap, but a real study sweeps a parameter: a flow
 curve over many shear rates, a spectrum over many frequencies, a LAOS map over a
@@ -870,18 +1337,49 @@ ordinary serial execution.
 The pieces check each other, which is the best defence against subtle errors:
 
 - the discrete steady state reproduces the analytic identity
-  $\alpha = \tfrac12 + \sqrt D + D$ to machine precision (operators + closure are
-  right);
+  $\alpha = \tfrac12 + \sqrt D + D$, converging at second order in $h$ (relative
+  error $7\times10^{-5}$ at $n_{\text{per unit}} = 200$, $\alpha = 0.8$) — the
+  operators and the closure are right, and the residual is pure discretisation;
 - the generator has exactly zero column sums and every run conserves mass to
   $\sim 10^{-8}$ (the scheme is genuinely conservative);
 - the time-stepping **engine** relaxes to the same stress as the direct
-  **oracle** to $\sim 10^{-11}$ (two independent methods agree);
+  **oracle** to $\sim 10^{-11}$, and (because the advection correction is applied
+  by defect correction rather than splitting) does so at *any* time step;
 - SAOS reproduces the Maxwell limits and the elastic plateau $G_0 = 1$;
 - LAOS first-harmonic moduli converge to the SAOS moduli as $\gamma_0 \to 0$, with
   the residual vanishing as $\Delta t \to 0$ at the expected first-order rate, and
-  even harmonics staying at the $10^{-8}$ noise floor;
+  even harmonics staying at the $10^{-8}$ noise floor (this last check is available
+  only under a pure sine — see §13, where the drift makes even harmonics physical);
 - the critical exponents come out as $\Sigma \sim \dot\gamma^{1/5}$ and
-  $\sigma_y \sim (\alpha_c - \alpha)^{1/2}$.
+  $\sigma_y \sim (\alpha_c - \alpha)^{1/2}$;
+- the yield-stress distribution $\rho_{\rm ac}$ matches its analytic forms — the
+  quiescent two-sided exponential with mean overshoot $\sqrt D$, the
+  direction-dependent sheared decay lengths $\ell_\pm$, and the symmetric period
+  average under oscillation;
+- the residence-time (age-at-yield) distribution has mean exactly $1/\Gamma$
+  (steady) and $1/\langle\Gamma\rangle$ (oscillation), satisfies
+  $P = \Gamma\int_0^\infty Q\,da$, and its high-shear tail decays at the bare
+  yielding rate $1/\tau = 1$;
+- the non-affine stress trajectory before yield reproduces the free-diffusion law
+  (non-affine MSD $\to 2Da$ at short age), its survivor stress moment satisfies the
+  macroscopic-stress identity $\Sigma = \Gamma\int_0^\infty m_1\,da$ to machine
+  precision, and under oscillation the birth-phase $t_0$ and $t_0 + T/2$ trajectories
+  are mirror images (equal MSD, opposite mean) to $\sim 10^{-9}$.
+- the yield-phase distribution — when in the cycle a block breaks, obtained by
+  folding $\psi(a;t_0)$ onto one period — reproduces the instantaneous yield rate
+  $\Gamma(\varphi)$ when summed over birth phases (weighted by $\Gamma(t_0)$), and
+  inherits the drive's half-period symmetry.
+- under **parallel superposition** the same pattern repeats one level up: the
+  linear perturbation about the sheared steady state carries no mass
+  ($\lvert\int p_1\rvert \sim 10^{-13}$, an exact identity); the
+  sheared-state moduli reproduce the SAOS moduli as $\dot\gamma_0 \to 0$, and do so
+  *quadratically*, which independently confirms that they are even in $\dot\gamma_0$
+  as the $\sigma\to-\sigma$ symmetry requires; the nonlinear limit cycle converges
+  onto those moduli at the integrator's first order in $\Delta t$ (successive
+  differences halving to within a few percent); and the cycle-mean stress recovers
+  the steady stress $\Sigma_s(\dot\gamma_0)$ with an $O(\gamma_A^2)$ offset — the
+  ratios come out at $4.00$ under successive halvings of $\gamma_A$, and the
+  second-harmonic intensity at $2.00$, pinning both scalings exactly.
 
 ## Reference
 

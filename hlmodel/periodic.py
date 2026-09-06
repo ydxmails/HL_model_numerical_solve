@@ -38,7 +38,8 @@ from scipy.optimize import newton_krylov, NoConvergence
 
 from .grid import Grid
 from .operators import build_static_parts
-from .observables import OscillatoryResponse, decompose_oscillatory
+from .observables import (OscillatoryResponse, decompose_oscillatory,
+                          YieldStressDistribution, yield_stress_distribution)
 from .protocols import Oscillatory
 from .selfconsistency import ALPHA_C
 from .transient import TransientStepper, initial_delta
@@ -56,6 +57,18 @@ class LAOSResult:
     floquet: float | None = None               # dominant |mu|, ~ omega_c / omega
     method: str = "newton_krylov"
     n_period_solves: int = 0
+    peak_cfl: float = 0.0                      # peak|gammadot| dt / h (diagnostic)
+    # The drive this cycle was actually produced with.  Recorded so that
+    # downstream analysis can tell -- a LAOSResult is otherwise
+    # indistinguishable from one made with a plain sine of the same
+    # (gamma0, omega), which is exactly the confusion that silently
+    # corrupts the cycle-analysis routines.  See protocols.require_sine_drive.
+    protocol: object | None = None
+    # Yield-stress distribution over the converged cycle; populated only when
+    # solve_laos is called with yield_phases not None (see below).
+    yield_distribution: "CycleYieldDistribution | None" = field(default=None,
+                                                                repr=False)
+
 
     @property
     def G1_prime(self) -> float:
@@ -71,10 +84,15 @@ class PeriodMap:
 
     def __init__(self, alpha: float, gamma0: float, omega: float, grid: Grid,
                  parts: dict | None = None, steps_per_period: int = 400,
-                 theta: float = 0.5, picard_iters: int = 1, dt_max: float = 0.5):
+                 theta: float = 0.5, picard_iters: int = 1, dt_max: float = 0.5,
+                 protocol=None):
         self.grid = grid
         self.parts = parts if parts is not None else build_static_parts(grid)
-        self.protocol = Oscillatory(gamma0, omega)
+        # ``protocol`` overrides the default sine drive.  Any object exposing
+        # ``period`` and ``gammadot(t)`` works -- the HL equation sees nothing but
+        # gammadot(t), so e.g. SuperposedShear (parallel superposition), square or
+        # multi-tone drives all slot in here with no change to the solvers.
+        self.protocol = Oscillatory(gamma0, omega) if protocol is None else protocol
         self.T = self.protocol.period
         # The explicit reaction half (yielding at rate 1/tau = 1) is stable only
         # for dt < 1, and a large dt also drives the implicit operator toward the
@@ -90,6 +108,41 @@ class PeriodMap:
                                         picard_iters=picard_iters)
         self.n_calls = 0
 
+    # -- diagnostics ---------------------------------------------------------
+    @property
+    def peak_rate(self) -> float:
+        """max |gammadot(t)| over one period (sampled; protocol-agnostic)."""
+        ts = np.linspace(0.0, self.T, 512, endpoint=False)
+        return float(np.max(np.abs(self.protocol.gammadot(ts))))
+
+    @property
+    def peak_cfl(self) -> float:
+        """Advective Courant number peak|gammadot| dt / h.
+
+        Reported, not enforced.  The explicit part of the TVD scheme is only the
+        *defect* between two advection discretisations, not the full advective
+        flux, so its stability limit is far weaker than this number suggests:
+        measured convergence stays clean and first order at peak_cfl ~ 5.  Treat
+        it as a scale, not a threshold.
+        """
+        return self.peak_rate * self.dt / self.grid.h
+
+    def _record_stride(self, n_sample: int) -> int:
+        """Record every ``rec`` steps, with ``rec`` a divisor of ``n_steps``.
+
+        ``decompose_oscillatory`` assumes its samples tile [0, T) uniformly with
+        the endpoint excluded.  That holds only when the stride divides the step
+        count; otherwise the last gap differs from the rest and the harmonic
+        projection aliases.  Measured: at omega = 0.3 with steps_per_period = 800
+        (stride 3, remainder 2) the even-harmonic content jumped from ~1e-11 to
+        1.9e-3 and the G'' convergence sequence broke.  Snapping down to the
+        nearest divisor costs at most a few extra samples.
+        """
+        rec = max(1, int(round(self.n_steps / max(1, int(n_sample)))))
+        while self.n_steps % rec:
+            rec -= 1
+        return rec
+
     def __call__(self, P0: np.ndarray) -> np.ndarray:
         self.n_calls += 1
         return self.stepper.propagate(P0, self.protocol.gammadot, self.T, self.dt,
@@ -97,12 +150,73 @@ class PeriodMap:
 
     def sample_stress(self, P0: np.ndarray, n_sample: int = 400):
         """Integrate one period from P0, returning (t, sigma(t)) over [0, T)."""
-        rec = max(1, int(round((self.T / self.dt) / n_sample)))
+        rec = self._record_stride(n_sample)
         traj = self.stepper.run(P0, self.protocol.gammadot, self.T, self.dt,
                                 t0=0.0, record_every=rec)
         # keep exactly one period, endpoint excluded
         keep = traj.t < self.T - 1e-9
         return traj.t[keep], traj.stress[keep]
+
+    def sample_states(self, P0: np.ndarray, n_sample: int = 400):
+        """Integrate one period from P0, returning (t, P(.,t)) over [0, T).
+
+        Like :meth:`sample_stress` but keeps the full distributions, for
+        cycle-averaged / phase-resolved post-processing (e.g. the yield-stress
+        distribution).  ``P_states`` has shape ``(len(t), grid.n)``.
+        """
+        rec = self._record_stride(n_sample)
+        traj = self.stepper.run(P0, self.protocol.gammadot, self.T, self.dt,
+                                t0=0.0, record_every=rec, record_states=True)
+        keep = traj.t < self.T - 1e-9
+        return traj.t[keep], traj.P_states[keep]
+
+
+@dataclass
+class CycleYieldDistribution:
+    """Yield-stress distribution rho_ac over one converged LAOS cycle.
+
+    ``averaged`` is the event-weighted period average -- the distribution of the
+    stress at which yield events happen, aggregated over a whole period.  It is
+    symmetric in sigma by the sine drive's half-period symmetry
+    (sigma, t) -> (-sigma, t + T/2), and is the oscillatory analogue of the
+    steady-shear rho_ac.  If phase resolution was requested, ``phase`` holds the
+    phases omega*t in [0, 2 pi) and ``resolved`` the instantaneous distributions
+    there (each asymmetric, biased toward the instantaneous flow direction).
+    """
+    omega: float
+    gamma0: float
+    averaged: YieldStressDistribution
+    phase: np.ndarray | None = None
+    resolved: list | None = None
+
+
+def cycle_yield_stress_distribution(pmap: "PeriodMap", P0: np.ndarray,
+                                    n_phases: int = 0, n_sample: int = 400
+                                    ) -> CycleYieldDistribution:
+    """Yield-stress distribution over a converged LAOS cycle.
+
+    Integrates one period from the cycle state ``P0`` and forms the
+    period-averaged rho_ac from the time-average of P (so it is normalised by the
+    cycle-mean yield rate <Gamma>).  With ``n_phases > 0`` it also returns the
+    instantaneous rho_ac at that many evenly spaced phases across the period.
+    """
+    t, P_states = pmap.sample_states(P0, n_sample=n_sample)
+    grid = pmap.grid
+    P_bar = P_states.mean(axis=0)                    # (1/T) int_0^T P dt over [0, T)
+    averaged = yield_stress_distribution(P_bar, grid)
+    phase = None
+    resolved = None
+    if n_phases and int(n_phases) > 0:
+        omega = pmap.protocol.omega
+        ph = (omega * t) % (2.0 * np.pi)
+        targets = np.linspace(0.0, 2.0 * np.pi, int(n_phases), endpoint=False)
+        # nearest sampled phase to each target (shortest circular distance)
+        idx = [int(np.argmin(np.abs(((ph - p + np.pi) % (2.0 * np.pi)) - np.pi)))
+               for p in targets]
+        phase = ph[idx]
+        resolved = [yield_stress_distribution(P_states[i], grid) for i in idx]
+    return CycleYieldDistribution(pmap.protocol.omega, pmap.protocol.gamma0,
+                                  averaged, phase, resolved)
 
 
 def _normalize(P: np.ndarray, grid: Grid) -> np.ndarray:
@@ -110,7 +224,7 @@ def _normalize(P: np.ndarray, grid: Grid) -> np.ndarray:
 
 
 def _default_seed(alpha: float, gamma0: float, omega: float, grid: Grid,
-                  parts: dict | None) -> np.ndarray:
+                  parts: dict | None, protocol=None) -> np.ndarray:
     """Physically-motivated initial guess for the periodic fixed-point solve.
 
     Liquid (alpha > alpha_c): the quiescent base state, which the small-amplitude
@@ -119,10 +233,16 @@ def _default_seed(alpha: float, gamma0: float, omega: float, grid: Grid,
     resembles steady shear at that rate -- a far better start than a delta at
     sigma = 0, which has essentially no overlap with the sheared cycle.
     """
-    if alpha > ALPHA_C:
+    drift = 0.0 if protocol is None else float(getattr(protocol, "mean_rate", 0.0))
+    gdot = (abs(float(gamma0) * float(omega)) if protocol is None
+            else float(getattr(protocol, "seed_rate", abs(gamma0 * omega))))
+    # With a steady drift the quiescent base state has essentially no overlap with
+    # the cycle even in the liquid phase, so seed from the sheared steady state
+    # regardless of alpha.  With drift == 0 this reduces exactly to the previous
+    # behaviour.
+    if alpha > ALPHA_C and drift == 0.0:
         from .saos import liquid_base_state
         return liquid_base_state(alpha, grid, parts)[0]
-    gdot = max(float(gamma0) * float(omega), 0.0)
     if gdot <= 0.0:
         return initial_delta(grid)
     try:
@@ -138,6 +258,7 @@ def solve_laos(alpha: float, gamma0: float, omega: float, grid: Grid | None = No
                max_iter: int = 200, P_init: np.ndarray | None = None,
                n_harmonics: int = 9, floquet: bool = False,
                theta: float = 0.5, dt_max: float = 0.5,
+               protocol=None, yield_phases: int | None = None,
                warn: bool = True, verbose: bool = False) -> LAOSResult:
     """Solve the periodic LAOS response and extract the moduli/harmonics.
 
@@ -145,6 +266,11 @@ def solve_laos(alpha: float, gamma0: float, omega: float, grid: Grid | None = No
     raised above ``steps_per_period`` so dt stays below the explicit reaction's
     stability limit (dt < 1).  Without this, low frequencies would otherwise use
     a huge, unstable dt.
+
+    ``yield_phases`` controls the yield-stress distribution rho_ac on the result
+    (``LAOSResult.yield_distribution``): ``None`` (default) skips it; ``0`` returns
+    the period-averaged distribution only; a positive integer additionally returns
+    the instantaneous distribution at that many evenly spaced phases.
     """
     if grid is None:
         grid = Grid()
@@ -153,12 +279,12 @@ def solve_laos(alpha: float, gamma0: float, omega: float, grid: Grid | None = No
 
     pmap = PeriodMap(alpha, gamma0, omega, grid, parts,
                      steps_per_period=steps_per_period, theta=theta,
-                     dt_max=dt_max)
+                     dt_max=dt_max, protocol=protocol)
 
     if P_init is not None:
         x0 = np.array(P_init, dtype=float)
     else:
-        x0 = _default_seed(alpha, gamma0, omega, grid, parts)
+        x0 = _default_seed(alpha, gamma0, omega, grid, parts, protocol)
     x0 = _normalize(np.asarray(x0, dtype=float), grid)
 
     used = method
@@ -219,8 +345,15 @@ def solve_laos(alpha: float, gamma0: float, omega: float, grid: Grid | None = No
 
     mu = _dominant_floquet(pmap, P0, grid) if floquet else None
 
+    ydist = None
+    if yield_phases is not None:
+        ydist = cycle_yield_stress_distribution(
+            pmap, P0, n_phases=int(yield_phases),
+            n_sample=max(8 * n_harmonics, 256))
+
     return LAOSResult(alpha, gamma0, omega, response, P0, residual, converged,
-                      mu, used, pmap.n_calls)
+                      mu, used, pmap.n_calls, pmap.peak_cfl, pmap.protocol,
+                      ydist)
 
 
 def _make_progress_cb(gamma0: float, omega: float, every: int = 1):

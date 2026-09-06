@@ -15,6 +15,26 @@ stationary solution, so this root is unique.
 
 This construction has no relaxation-time problem, so it is fast and accurate
 exactly where the transient integrator crawls (low rate, alpha -> alpha_c).
+
+Advection scheme
+----------------
+``advection="tvd"`` (default) uses the same second-order van Leer flux as the
+transient integrator, so the two engines discretise the same equation and their
+cross-check is meaningful.  Because the limiter is solution dependent the
+stationary problem is nonlinear, and we solve it by **defect correction**: the
+monotone upwind matrix stays on the left as a preconditioner and the difference
+between the two flux divergences is carried on the right,
+
+    (D L2 + A_up + Y + S) P^{k+1} = A_up P^k - Adv_tvd(P^k) ,
+
+whose fixed point satisfies the TVD stationary equation exactly.  Both sides of
+the defect are conservative flux divergences, so it sums to zero and the dropped
+row stays redundant; the upwind factorisation is reused across iterations, so
+the extra cost is a handful of triangular solves.
+
+``advection="upwind"`` restores the original first-order operator.  It is ~1%
+low in stress at typical resolutions because its numerical diffusion
+D_num ~ |gammadot| h / 2 produces spurious yielding.
 """
 
 from __future__ import annotations
@@ -28,7 +48,7 @@ import scipy.sparse.linalg as spla
 from scipy.optimize import brentq
 
 from .grid import Grid
-from .operators import advection_matrix, build_static_parts
+from .operators import advection_matrix, advection_tvd_rhs, build_static_parts
 from .selfconsistency import ALPHA_C, D_quiescent
 
 # Probability allowed within the outer 10% of the domain before we judge the box
@@ -48,6 +68,18 @@ class SteadyResult:
     converged: bool = True          # False if D hit the conditioning floor (rate too low)
     boundary_fraction: float = 0.0  # probability mass in the outer 10% of the domain
 
+    def yield_stress_distribution(self):
+        """Distribution rho_ac(sigma) of the local stress at yield for this state.
+
+        Returns a :class:`~hlmodel.observables.YieldStressDistribution`.  Under
+        steady shear it is asymmetric (biased toward the flow direction); the
+        quiescent liquid gives a symmetric two-sided exponential with mean
+        overshoot sqrt(D).  In the jammed, frozen quiescent state nothing yields
+        and the result has ``defined=False``.
+        """
+        from .observables import yield_stress_distribution
+        return yield_stress_distribution(self.P, self.grid)
+
 
 def _boundary_fraction(P: np.ndarray, grid: Grid) -> float:
     """Fraction of probability sitting in the outer 10% of the stress domain.
@@ -61,13 +93,28 @@ def _boundary_fraction(P: np.ndarray, grid: Grid) -> float:
 
 
 def stationary_distribution(D: float, gammadot: float, grid: Grid,
-                            parts: dict | None = None) -> np.ndarray:
+                            parts: dict | None = None,
+                            advection: str = "tvd",
+                            tvd_iters: int = 100,
+                            tvd_tol: float = 1e-11,
+                            P_init: np.ndarray | None = None) -> np.ndarray:
     """Normalised stationary P for fixed (D, gammadot).
 
-    Solves G P = 0 with one row swapped for the normalisation constraint.
+    Solves G P = 0 with one row swapped for the normalisation constraint.  With
+    ``advection="tvd"`` the upwind flux is upgraded to the van Leer flux by the
+    defect-correction iteration described in the module docstring; the upwind
+    solve is its own initial guess, so ``advection="upwind"`` is just this
+    routine with zero corrections.
+
+    ``P_init`` seeds that iteration (e.g. the converged distribution at a nearby
+    D during the closure root-find), which typically cuts the sweep count several
+    fold.  It only affects the iteration count, never the fixed point.
     """
     if parts is None:
         parts = build_static_parts(grid)
+    if advection not in ("tvd", "upwind"):
+        raise ValueError("advection must be 'tvd' or 'upwind'")
+
     A = advection_matrix(gammadot, grid)
     G = (D * parts["L2"] + A + parts["Yield"] + parts["Source"]).tolil()
 
@@ -77,14 +124,49 @@ def stationary_distribution(D: float, gammadot: float, grid: Grid,
     b = np.zeros(n)
     b[n - 1] = 1.0
 
-    P = spla.spsolve(G.tocsr(), b)
+    # Factorise the *transpose*.  The normalisation row (and the reinjection
+    # source row) are dense, and as rows they force SuperLU into catastrophic
+    # fill-in -- nnz(LU) ~ 1.3e6 for n = 2001, ~40x slower.  Transposed they are
+    # dense *columns*, which COLAMD simply orders last: nnz(LU) ~ 1.3e4.  Solving
+    # with trans="T" recovers G P = b exactly (this is also, bit for bit, what
+    # spsolve does internally when handed a CSR matrix).
+    lu = spla.splu(G.tocsr().T.tocsc())
+    if advection == "upwind" or gammadot == 0.0:
+        return lu.solve(b, trans="T")
+
+    # Every defect-correction sweep is then just a pair of triangular solves.
+    if P_init is not None and np.shape(P_init) == (n,) and np.all(np.isfinite(P_init)):
+        P = np.array(P_init, dtype=float)
+    else:
+        P = lu.solve(b, trans="T")
+    for _ in range(tvd_iters):
+        # Defect: what the upwind operator adds over the flux-limited one.  Both
+        # terms are flux divergences, so this sums to zero and the linear system
+        # stays consistent with the dropped conservation row.
+        rhs = A @ P - advection_tvd_rhs(P, gammadot, grid)
+        rhs[n - 1] = 1.0                      # normalisation row is untouched
+        P_new = lu.solve(rhs, trans="T")
+        delta = float(np.max(np.abs(P_new - P)))
+        P = P_new
+        if delta <= tvd_tol * max(1.0, float(np.max(np.abs(P)))):
+            break
     return P
 
 
 def _closure_residual(D: float, alpha: float, gammadot: float, grid: Grid,
-                      parts: dict) -> float:
-    """r(D) = alpha * Gamma(P(D)) - D; a root is a self-consistent state."""
-    P = stationary_distribution(D, gammadot, grid, parts)
+                      parts: dict, advection: str = "tvd",
+                      cache: dict | None = None) -> float:
+    """r(D) = alpha * Gamma(P(D)) - D; a root is a self-consistent state.
+
+    ``cache`` (a plain dict) carries the last converged P forward as the warm
+    start for the next D, which is what makes the defect-corrected root-find
+    cost comparable to the plain upwind one.
+    """
+    P_init = cache.get("P") if cache is not None else None
+    P = stationary_distribution(D, gammadot, grid, parts, advection=advection,
+                               P_init=P_init)
+    if cache is not None:
+        cache["P"] = P
     Gamma = grid.yield_fraction(P)
     return alpha * Gamma - D
 
@@ -92,7 +174,7 @@ def _closure_residual(D: float, alpha: float, gammadot: float, grid: Grid,
 def solve_steady(alpha: float, gammadot: float, grid: Grid | None = None,
                  parts: dict | None = None,
                  D_hi: float = 5.0, n_scan: int = 80,
-                 warn: bool = True) -> SteadyResult:
+                 warn: bool = True, advection: str = "tvd") -> SteadyResult:
     """Solve the steady HL state at coupling ``alpha`` and shear rate ``gammadot``.
 
     Returns a :class:`SteadyResult` with the noise amplitude D, yielding rate
@@ -104,6 +186,9 @@ def solve_steady(alpha: float, gammadot: float, grid: Grid | None = None,
     ``n_per_unit``) or the distribution is being truncated by the domain (too much
     probability near +/-sigma_max -> increase ``sigma_max``).  Sweep drivers pass
     ``warn=False`` and aggregate the diagnostics instead.
+
+    ``advection`` selects the spatial flux ("tvd", default, matching the
+    transient integrator; "upwind" for the legacy first-order operator).
     """
     if grid is None:
         grid = Grid()
@@ -125,7 +210,7 @@ def solve_steady(alpha: float, gammadot: float, grid: Grid | None = None,
             P = np.zeros(grid.n)
             P[grid.i_zero] = 1.0 / grid.h  # representative delta at sigma = 0
             return SteadyResult(alpha, 0.0, 0.0, 0.0, 0.0, P, grid)
-        P = stationary_distribution(D0, 0.0, grid, parts)
+        P = stationary_distribution(D0, 0.0, grid, parts, advection=advection)
         return SteadyResult(alpha, 0.0, float(D0),
                             float(grid.yield_fraction(P)),
                             float(grid.first_moment(P)), P, grid,
@@ -133,7 +218,9 @@ def solve_steady(alpha: float, gammadot: float, grid: Grid | None = None,
 
     # ---- Sheared state: root-find the self-consistent D -----------------------
     Ds = np.logspace(np.log10(D_lo), np.log10(D_hi), n_scan)
-    rs = np.array([_closure_residual(D, alpha, gd, grid, parts) for D in Ds])
+    cache: dict = {}
+    rs = np.array([_closure_residual(D, alpha, gd, grid, parts, advection, cache)
+                   for D in Ds])
 
     root = None
     for k in range(len(Ds) - 1):
@@ -142,7 +229,8 @@ def solve_steady(alpha: float, gammadot: float, grid: Grid | None = None,
             break
         if np.isfinite(rs[k]) and np.isfinite(rs[k + 1]) and rs[k] * rs[k + 1] < 0.0:
             root = brentq(_closure_residual, Ds[k], Ds[k + 1],
-                          args=(alpha, gd, grid, parts), xtol=1e-13, rtol=1e-13)
+                          args=(alpha, gd, grid, parts, advection, cache),
+                          xtol=1e-13, rtol=1e-13)
             break
 
     converged = root is not None
@@ -152,7 +240,8 @@ def solve_steady(alpha: float, gammadot: float, grid: Grid | None = None,
         root = D_lo
 
     D = float(root)
-    P = stationary_distribution(D, gd, grid, parts)
+    P = stationary_distribution(D, gd, grid, parts, advection=advection,
+                                P_init=cache.get("P"))
     Gamma = float(grid.yield_fraction(P))
     stress = sgn * float(grid.first_moment(P))
     bfrac = _boundary_fraction(P, grid)

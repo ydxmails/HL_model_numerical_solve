@@ -36,10 +36,12 @@ except Exception:  # threadpoolctl is optional
 
 from .grid import Grid
 from .operators import build_static_parts
-from .saos import liquid_base_state, saos_modulus
+from .saos import liquid_base_state, saos_modulus, psr_modulus
 from .selfconsistency import ALPHA_C
 from .steady import solve_steady, BOUNDARY_FRACTION_TOL
 from .periodic import solve_laos
+from .protocols import SuperposedShear
+from .superposed import solve_superposed
 
 
 # --------------------------------------------------------------------------
@@ -74,6 +76,28 @@ def _saos_task(args):
         parts = build_static_parts(grid)
         Gp, Gpp = saos_modulus(alpha, omega, grid, parts, base=base)
     return (omega, Gp, Gpp)
+
+
+def _psr_task(args):
+    alpha, gammadot0, omega, grid_spec, base = args
+    with _limit_threads():
+        grid = _make_grid(grid_spec)
+        parts = build_static_parts(grid)
+        Gp, Gpp = psr_modulus(alpha, gammadot0, omega, grid, parts, base=base)
+    return (omega, Gp, Gpp)
+
+
+def _superposed_task(args):
+    alpha, gammadot0, gammaA, omega, grid_spec, opts = args
+    opts = dict(opts)
+    opts.setdefault("warn", False)   # aggregate in the parent instead of per worker
+    with _limit_threads():
+        grid = _make_grid(grid_spec)
+        res = solve_superposed(alpha, gammadot0, gammaA, omega, grid, **opts)
+    return (gammaA, omega, res.mean_stress, res.steady_stress,
+            res.G1_prime, res.G1_doubleprime, res.Gp_linear, res.Gpp_linear,
+            res.response.intensity.copy(), res.residual, res.floquet,
+            res.converged)
 
 
 def _laos_task(args):
@@ -342,3 +366,138 @@ def omega_sweep(alpha: float, gamma0: float, omegas, grid: Grid | None = None,
         resid[idx] = r.residual; conv[idx] = r.converged; meth[idx] = r.method
     return LAOSSweepResult(alpha, np.atleast_1d(float(gamma0)), ws,
                            Gp, Gpp, resid, conv, meth)
+
+
+# --------------------------------------------------------------------------
+# parallel superposition
+# --------------------------------------------------------------------------
+@dataclass
+class PSRSpectrum:
+    """Parallel-superposition linear moduli over frequency at fixed shear rate."""
+    alpha: float
+    gammadot0: float
+    omega: np.ndarray
+    Gp: np.ndarray                # G'_parallel(omega; gammadot0)
+    Gpp: np.ndarray               # G''_parallel(omega; gammadot0)
+    steady_stress: float = 0.0    # unperturbed Sigma(gammadot0)
+
+    @property
+    def negative_Gp(self) -> np.ndarray:
+        """Mask of frequencies where the storage modulus is negative.
+
+        Not a bug.  G'_parallel goes negative at low frequency in strongly
+        shear-thinning states -- the classic parallel-superposition pathology.
+        Here it comes out of an exact linear-response solve about the steady
+        state, so it is a property of the model rather than of the measurement.
+        """
+        return self.Gp < 0.0
+
+
+def psr_spectrum_sweep(alpha: float, gammadot0: float, omegas,
+                       grid: Grid | None = None,
+                       n_workers: int | None = None) -> PSRSpectrum:
+    """Parallel-superposition moduli over many frequencies (shared base state).
+
+    Cheap: no time stepping, two banded solves per frequency.  The sheared steady
+    state is solved once in the parent and shared with every worker, exactly as
+    ``saos_spectrum`` shares the quiescent base state.
+    """
+    if grid is None:
+        grid = Grid()
+    spec = (grid.sigma_max, grid.n_per_unit)
+    parts = build_static_parts(grid)
+    base = solve_steady(alpha, abs(float(gammadot0)), grid, parts, warn=False)
+    ws = np.atleast_1d(np.asarray(omegas, dtype=float))
+    args = [(alpha, float(gammadot0), float(w), spec, base) for w in ws]
+    out = parallel_map(_psr_task, args, n_workers)
+    return PSRSpectrum(alpha, float(gammadot0), ws,
+                       np.array([o[1] for o in out]),
+                       np.array([o[2] for o in out]),
+                       float(base.stress))
+
+
+@dataclass
+class SuperposedMap:
+    """Superposed cycles over a (gammaA, omega) grid at fixed gammadot0."""
+    alpha: float
+    gammadot0: float
+    gammaA: np.ndarray            # grid of oscillation amplitudes
+    omega: np.ndarray             # grid of frequencies
+    mean_stress: np.ndarray       # shape (len(gammaA), len(omega))
+    steady_stress: float          # unperturbed reference, scalar
+    G1p: np.ndarray
+    G1pp: np.ndarray
+    Gp_linear: np.ndarray         # exact gammaA -> 0 moduli, same shape
+    Gpp_linear: np.ndarray
+    residual: np.ndarray
+    floquet: np.ndarray
+    converged: np.ndarray
+
+    @property
+    def Lambda(self) -> np.ndarray:
+        """Regime parameter gammaA omega / gammadot0, broadcast over the grid."""
+        return np.abs(np.outer(self.gammaA, self.omega) / self.gammadot0)
+
+    @property
+    def thinning(self) -> np.ndarray:
+        """Oscillation-induced change in mean stress (negative = fluidised).
+
+        The robust observable of the pair: nearly dt-independent, unlike the
+        moduli.  This is the fluidisation map.
+        """
+        return self.mean_stress - self.steady_stress
+
+
+def superposed_map(alpha: float, gammadot0: float, gammaAs, omegas,
+                   grid: Grid | None = None, n_workers: int | None = None,
+                   **solver_opts) -> SuperposedMap:
+    """Superposed limit cycles over a (gammaA, omega) grid, in parallel.
+
+    Non-converged points are reported in one consolidated warning rather than
+    from each worker, matching ``laos_map``.
+    """
+    if grid is None:
+        grid = Grid()
+    spec = (grid.sigma_max, grid.n_per_unit)
+    gAs = np.atleast_1d(np.asarray(gammaAs, dtype=float))
+    ws = np.atleast_1d(np.asarray(omegas, dtype=float))
+    args = [(alpha, float(gammadot0), float(a), float(w), spec, solver_opts)
+            for a in gAs for w in ws]
+    # same cost proxy as laos_map: step count is bounded below by
+    # steps_per_period and grows like 1/omega once dt hits its cap.
+    spp = float(solver_opts.get("steps_per_period", 400))
+    dt_cap = min(float(solver_opts.get("dt_max", 0.5)), 0.9)
+    cost = [max(spp, np.ceil((2.0 * np.pi / float(w)) / dt_cap))
+            for _a in gAs for w in ws]
+    out = parallel_map(_superposed_task, args, n_workers, cost=cost)
+
+    na, nw = gAs.size, ws.size
+    shape = (na, nw)
+    mean = np.empty(shape); G1p = np.empty(shape); G1pp = np.empty(shape)
+    Gpl = np.empty(shape); Gppl = np.empty(shape)
+    resid = np.empty(shape); floq = np.full(shape, np.nan)
+    conv = np.empty(shape, dtype=bool)
+    sigma_s = 0.0
+    idx = 0
+    for i in range(na):
+        for j in range(nw):
+            (_a, _w, ms, ss, gp, gpp, gpl, gppl, _inten, r, mu, cflag) = out[idx]
+            mean[i, j] = ms; sigma_s = ss
+            G1p[i, j] = gp; G1pp[i, j] = gpp
+            Gpl[i, j] = gpl; Gppl[i, j] = gppl
+            resid[i, j] = r; conv[i, j] = cflag
+            if mu is not None:
+                floq[i, j] = mu
+            idx += 1
+
+    n_bad = int((~conv).sum())
+    if n_bad:
+        warnings.warn(
+            f"{n_bad} of {conv.size} superposed point(s) did not converge "
+            f"(relative cycle-closure error > 1e-3); see the returned "
+            f"`converged` array. Superposition is normally well conditioned -- "
+            f"the drift keeps the material fluidised -- so failures here usually "
+            f"mean too few steps_per_period at large gammaA*omega rather than "
+            f"critical slowing down.", RuntimeWarning, stacklevel=2)
+    return SuperposedMap(alpha, float(gammadot0), gAs, ws, mean, float(sigma_s),
+                         G1p, G1pp, Gpl, Gppl, resid, floq, conv)

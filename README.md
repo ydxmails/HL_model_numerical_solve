@@ -5,7 +5,8 @@ rheology of soft glassy materials. The package solves the self-consistent
 Fokker–Planck equation for the local-stress distribution and computes:
 
 - **steady shear** — flow curves $\Sigma(\dot\gamma)$, with a direct stationary
-  solver and an independent transient integrator that agree to ~1e-11;
+  solver and an independent transient integrator that agree to ~1e-11 at any
+  time step (both use the same second-order-accurate spatial scheme);
 - **SAOS** — linear viscoelastic moduli $G'(\omega), G''(\omega)$ by
   linearisation about the liquid base state (one solve per frequency);
 - **LAOS** — the nonlinear periodic response as a periodic-orbit fixed point of

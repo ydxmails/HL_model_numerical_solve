@@ -22,16 +22,49 @@ from .grid import Grid
 from .selfconsistency import ALPHA_C, D_quiescent, alpha_of_D_quiescent
 from .operators import generator, build_static_parts
 from .steady import SteadyResult, solve_steady, stationary_distribution
-from .protocols import SteadyShear, Oscillatory
+from .protocols import (SteadyShear, Oscillatory, SuperposedShear,
+                        require_sine_drive)
+from .superposed import SuperposedResult, solve_superposed
 from .transient import TransientStepper, Trajectory, initial_delta
 from .observables import (
     OscillatoryResponse,
     decompose_oscillatory,
     macroscopic_stress,
     yielding_rate,
+    YieldStressDistribution,
+    yield_stress_distribution,
 )
-from .saos import SAOSResult, saos_modulus, saos_spectrum, liquid_base_state
-from .periodic import LAOSResult, PeriodMap, solve_laos
+from .saos import (SAOSResult, saos_modulus, saos_spectrum, liquid_base_state,
+                   PSRResult, psr_modulus, psr_spectrum)
+from .periodic import (
+    LAOSResult,
+    PeriodMap,
+    solve_laos,
+    CycleYieldDistribution,
+    cycle_yield_stress_distribution,
+)
+from .residence import (
+    ResidenceTimeDistribution,
+    residence_time_distribution,
+    CycleResidenceDistribution,
+    cycle_residence_time_distribution,
+    NonAffineStressTrajectory,
+    nonaffine_stress_trajectory,
+    CycleNonAffineStressTrajectory,
+    cycle_nonaffine_stress_trajectory,
+    YieldPhaseDistribution,
+    cycle_yield_phase_distribution,
+)
+
+from .recovery import (
+    RecoveryResult,
+    CycleRecovery,
+    affine_shift,
+    plastic_stress,
+    recover_from_state,
+    steady_recovery,
+    laos_recovery,
+)
 
 __all__ = [
     "Grid",
@@ -45,6 +78,10 @@ __all__ = [
     "stationary_distribution",
     "SteadyShear",
     "Oscillatory",
+    "SuperposedShear",
+    "require_sine_drive",
+    "SuperposedResult",
+    "solve_superposed",
     "TransientStepper",
     "Trajectory",
     "initial_delta",
@@ -52,13 +89,37 @@ __all__ = [
     "decompose_oscillatory",
     "macroscopic_stress",
     "yielding_rate",
+    "YieldStressDistribution",
+    "yield_stress_distribution",
     "SAOSResult",
     "saos_modulus",
     "saos_spectrum",
     "liquid_base_state",
+    "PSRResult",
+    "psr_modulus",
+    "psr_spectrum",
     "LAOSResult",
     "PeriodMap",
     "solve_laos",
+    "CycleYieldDistribution",
+    "cycle_yield_stress_distribution",
+    "ResidenceTimeDistribution",
+    "residence_time_distribution",
+    "CycleResidenceDistribution",
+    "cycle_residence_time_distribution",
+    "NonAffineStressTrajectory",
+    "nonaffine_stress_trajectory",
+    "CycleNonAffineStressTrajectory",
+    "cycle_nonaffine_stress_trajectory",
+    "YieldPhaseDistribution",
+    "cycle_yield_phase_distribution",
+    "RecoveryResult",
+    "CycleRecovery",
+    "affine_shift",
+    "plastic_stress",
+    "recover_from_state",
+    "steady_recovery",
+    "laos_recovery",
 ]
 
 __version__ = "0.1.0"
